@@ -19,8 +19,12 @@ from local_replay import write_json
 BASE = Path(__file__).resolve().parent
 RUNTIME = BASE / "local-data" / "rog"
 def default_destination():
-    if Path(r"E:\Videos").exists():
-        return r"E:\Videos"
+    if os.name == "nt":
+        import ctypes
+        # Do not touch a disconnected mapped drive while importing the module.
+        if ctypes.windll.kernel32.GetDriveTypeW("D:\\") in (2, 3):
+            return r"D:\Videos\Icouse"
+        return r"\\192.168.137.1\D\Videos\Icouse"
     return str(Path.home() / "Videos" / "iCourse")
 
 
@@ -64,10 +68,11 @@ def settings():
 
 
 @contextlib.contextmanager
-def queue_lock():
+def queue_lock(path=None):
     """OS lock releases on process exit; no stale lock after power loss."""
-    RUNTIME.mkdir(parents=True, exist_ok=True)
-    with (RUNTIME/"queue.lock").open("a+b") as f:
+    path = Path(path) if path is not None else RUNTIME/"queue.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as f:
         f.seek(0); f.write(b"0"); f.flush(); f.seek(0)
         if os.name == "nt":
             import msvcrt
@@ -262,6 +267,7 @@ def subtitle_text(segments):
 
 
 def catalog(config):
+    from portable.player import lesson_preview
     ensure_network_share()
     result = []
     for root_index, root in enumerate(roots(config)):
@@ -280,7 +286,8 @@ def catalog(config):
                 num = int(match.group(1)) if match else 0
                 meta = read_json(folder/(video.stem+".lesson.json"), {})
                 lessons.append({"number": num, "name": video.stem, "video": video.name,
-                                "subtitle": video.with_suffix(".vtt").exists(), **meta})
+                                **meta, "subtitle": video.with_suffix(".vtt").exists(),
+                                "thumbnail": lesson_preview(folder, video.stem)})
             if lessons:
                 lessons.sort(key=lambda x: (x["number"] if x["number"] > 0 else 9999, x["name"]))
                 result.append({"root": root_index, "folder": folder.name, "title": folder.name,
@@ -363,10 +370,24 @@ def run(command, only=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["download", "transfer", "subtitles", "status", "app", "setup"])
+    parser.add_argument("command", choices=["download", "transfer", "subtitles", "cloud", "status", "app", "setup"])
+    parser.add_argument("--config", type=Path, help="使用独立的 JSON 配置文件")
     parser.add_argument("--lesson")
     parser.add_argument("--open", action="store_true", help="在浏览器中自动打开")
     args = parser.parse_args()
+    config = None
+    if args.command == "cloud" and args.config is None:
+        parser.error("cloud 需要 --config")
+    if args.config is not None:
+        if args.command != "cloud":
+            parser.error("--config 仅适用于 cloud")
+        try:
+            config = json.loads(args.config.read_text(encoding="utf-8-sig"))
+            if not isinstance(config, dict) or not config.get("repository") or not config.get("database"):
+                raise ValueError("Config requires repository and database")
+        except (OSError, ValueError) as error:
+            parser.error("--config 必须是含 repository/database 的 JSON 对象 ("+type(error).__name__+")")
+    record_run = args.command != "cloud"
     if args.command == "app":
         from desktop.server import serve
         serve(open_browser=args.open)
@@ -379,14 +400,23 @@ def main():
         print(json.dumps(catalog(settings()), ensure_ascii=False, indent=2))
     else:
         try:
-            result = run(args.command, args.lesson)
-            write_json(RUNTIME/"last-run.json", {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "command": args.command, **result})
+            if args.command == "cloud":
+                from desktop.downloader import cloud_database
+                database = Path(config["database"])
+                with queue_lock(database.with_name(database.name + ".lock")):
+                    dbpath = cloud_database(config)
+                result = {"database": str(dbpath) if dbpath is not None else None}
+            else:
+                result = run(args.command, args.lesson)
+            if record_run:
+                write_json(RUNTIME/"last-run.json", {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "command": args.command, **result})
             print(json.dumps(result, ensure_ascii=False))
             if result.get("errors"):
                 raise SystemExit(1)
         except Exception as e:
             # Request exceptions can embed signed URLs. Never persist them.
-            write_json(RUNTIME/"last-run.json", {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "command": args.command, "error": type(e).__name__})
+            if record_run:
+                write_json(RUNTIME/"last-run.json", {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "command": args.command, "error": type(e).__name__})
             print("任务未完成，请检查设置或网络 ("+type(e).__name__+")")
             raise SystemExit(1)
 
